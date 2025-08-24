@@ -1,0 +1,6 @@
+{
+  "appId": "com.mathe.glowup",
+  "appName": "GlowUp Money",
+  "webDir": "web",
+  "bundledWebRuntime": false
+}
