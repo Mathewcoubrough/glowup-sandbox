@@ -58,3 +58,19 @@ jobs:
         run: |
           xcodebuild -list -workspace ios/App/App.xcworkspace || true
           xcodebuild -list -project ios/App/App.xcodeproj || true
+      - name: Collect quick diagnostics
+        run: |
+          {
+            echo "=== ENV ==="; sw_vers; xcodebuild -version;
+            echo "=== SIMULATORS (first 120 lines) ==="; xcrun simctl list devices available | sed -n '1,120p';
+            echo "=== TREE ==="; find ios -maxdepth 2 -type f | sort | sed -n '1,200p';
+            echo "=== PODS ==="; cd ios/App && pod --version && pod list || true; cd ../..;
+            echo "=== LIST WORKSPACE ==="; xcodebuild -list -workspace ios/App/App.xcworkspace || true;
+            echo "=== LIST PROJECT ==="; xcodebuild -list -project ios/App/App.xcodeproj || true;
+          } | tee diagnostics.txt
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-diagnostics
+          path: diagnostics.txt
