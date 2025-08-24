@@ -1,4 +1,4 @@
-name: iOS App Store build & upload (Apple ID)
+name: iOS App Store build & upload (Apple ID, DEBUG)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   build-upload:
     runs-on: macos-14
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -22,24 +22,32 @@ jobs:
 
       - name: Ensure Capacitor app files
         run: |
-          set -e
+          set -euxo pipefail
           test -f package.json || echo '{ "name":"glowup","version":"1.0.0","private":true }' > package.json
           test -f capacitor.config.json || cat > capacitor.config.json <<EOF
           { "appId": "${{ secrets.APP_BUNDLE_ID }}", "appName": "GlowUp Money", "webDir": "web", "bundledWebRuntime": false }
           EOF
-          mkdir -p web
+          mkdir -p web build
           test -f web/index.html || echo '<!doctype html><title>GlowUp</title><body>Build</body>' > web/index.html
+          echo "APP_BUNDLE_ID=${{ secrets.APP_BUNDLE_ID }}"
+          echo "TEAM_ID=${{ secrets.TEAM_ID }}"
 
       - name: Install Capacitor toolchain
-        run: npm i -D @capacitor/cli @capacitor/core @capacitor/ios
+        run: |
+          set -euxo pipefail
+          npm i -D @capacitor/cli @capacitor/core @capacitor/ios
 
       - name: Add & sync iOS
         run: |
+          set -euxo pipefail
           npx cap add ios || true
           npx cap sync ios
+          ls -la ios || true
+          ls -la ios/App || true
 
       - name: Install CocoaPods (CDN)
         run: |
+          set -euxo pipefail
           if ! command -v pod >/dev/null 2>&1; then sudo gem install cocoapods -NV; fi
           cd ios/App
           if [ -f Podfile ]; then
@@ -54,7 +62,7 @@ jobs:
             end
             PODS
           fi
-          pod install --no-repo-update
+          pod install --no-repo-update --verbose
           cd ../..
 
       - name: Import signing assets
@@ -63,7 +71,7 @@ jobs:
           IOS_CERT_PASSWORD:   ${{ secrets.IOS_CERT_PASSWORD }}
           IOS_PROFILE_BASE64:  ${{ secrets.IOS_PROFILE_BASE64 }}
         run: |
-          set -e
+          set -euxo pipefail
           echo "$IOS_CERT_P12_BASE64" | base64 --decode > signing.p12
           echo "$IOS_PROFILE_BASE64"  | base64 --decode > profile.mobileprovision
 
@@ -82,35 +90,62 @@ jobs:
           PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
           cp profile.mobileprovision "$PROFILE_PATH"
 
-          UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin <<< "$(security cms -D -i "$PROFILE_PATH")")
-          NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name'  /dev/stdin <<< "$(security cms -D -i "$PROFILE_PATH")")
+          # Parse and print profile details
+          PROFILE_PLIST="$(security cms -D -i "$PROFILE_PATH")"
+          echo "$PROFILE_PLIST" > build/profile.plist
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin <<< "$PROFILE_PLIST")
+          NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin <<< "$PROFILE_PLIST")
+          APPID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' /dev/stdin <<< "$PROFILE_PLIST" || true)
+          TEAMINPROF=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' /dev/stdin <<< "$PROFILE_PLIST" || true)
           echo "PROFILE_UUID=$UUID" >> $GITHUB_ENV
           echo "PROFILE_NAME=$NAME"  >> $GITHUB_ENV
-          echo "Using provisioning profile: $NAME ($UUID)"
+          echo "Profile name: $NAME"
+          echo "Profile UUID: $UUID"
+          echo "Profile application-identifier: $APPID"
+          echo "Profile TeamIdentifier[0]: $TEAMINPROF"
+
+          # Sanity check: bundle id match
+          if [[ -n "${{ secrets.APP_BUNDLE_ID }}" && -n "$APPID" ]]; then
+            if [[ "$APPID" != *".${{ secrets.APP_BUNDLE_ID }}" ]]; then
+              echo "::error::Provisioning profile app id ($APPID) does not match APP_BUNDLE_ID (${{ secrets.APP_BUNDLE_ID }})"
+              exit 1
+            fi
+          fi
+
+      - name: Show Xcode setup / schemes
+        run: |
+          set -euxo pipefail
+          xcodebuild -version
+          xcodebuild -showsdks
+          xcodebuild -list -workspace ios/App/App.xcworkspace | tee build/xcodebuild-list.txt || true
+          xcodebuild -list -project ios/App/App.xcodeproj | tee -a build/xcodebuild-list.txt || true
 
       - name: Set build number
         env:
           NUM: ${{ github.run_number }}
         run: |
+          set -euxo pipefail
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $NUM" ios/App/App/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Print" ios/App/App/Info.plist | sed -n '1,120p' || true
 
       - name: Archive (Release)
         env:
           TEAM_ID:       ${{ secrets.TEAM_ID }}
           APP_BUNDLE_ID: ${{ secrets.APP_BUNDLE_ID }}
         run: |
-          set -e
-          FLAGS="DEVELOPMENT_TEAM=$TEAM_ID PRODUCT_BUNDLE_IDENTIFIER=$APP_BUNDLE_ID CODE_SIGN_STYLE=Manual PROVISIONING_PROFILE_SPECIFIER=$PROFILE_NAME PROVISIONING_PROFILE=$PROFILE_UUID"
+          set -euxo pipefail
+          FLAGS="DEVELOPMENT_TEAM=$TEAM_ID PRODUCT_BUNDLE_IDENTIFIER=$APP_BUNDLE_ID CODE_SIGN_STYLE=Manual PROVISIONING_PROFILE_SPECIFIER=$PROFILE_NAME PROVISIONING_PROFILE=$PROFILE_UUID OTHER_CODE_SIGN_FLAGS=--keychain\ build.keychain-db"
           if [ -f "ios/App/App.xcworkspace" ]; then
-            xcodebuild -workspace ios/App/App.xcworkspace -scheme App -configuration Release -destination 'generic/platform=iOS' $FLAGS -archivePath $PWD/build/App.xcarchive clean archive
+            xcodebuild -workspace ios/App/App.xcworkspace -scheme App -configuration Release -destination 'generic/platform=iOS' $FLAGS -archivePath $PWD/build/App.xcarchive clean archive | tee build/xcodebuild-archive.log
           else
-            xcodebuild -project ios/App/App.xcodeproj     -scheme App -configuration Release -destination 'generic/platform=iOS' $FLAGS -archivePath $PWD/build/App.xcarchive clean archive
+            xcodebuild -project ios/App/App.xcodeproj     -scheme App -configuration Release -destination 'generic/platform=iOS' $FLAGS -archivePath $PWD/build/App.xcarchive clean archive | tee build/xcodebuild-archive.log
           fi
 
       - name: Export IPA (App Store)
         env:
           APP_BUNDLE_ID: ${{ secrets.APP_BUNDLE_ID }}
         run: |
+          set -euxo pipefail
           cat > ExportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -125,24 +160,30 @@ jobs:
             <key>compileBitcode</key><false/>
           </dict></plist>
           EOF
-          xcodebuild -exportArchive -archivePath $PWD/build/App.xcarchive -exportOptionsPlist ExportOptions.plist -exportPath $PWD/build
+          xcodebuild -exportArchive -archivePath $PWD/build/App.xcarchive -exportOptionsPlist ExportOptions.plist -exportPath $PWD/build | tee build/xcodebuild-export.log
+          ls -la build || true
 
       - name: Upload to TestFlight (Apple ID auth)
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD: ${{ secrets.FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD }}
         run: |
-          set -e
+          set -euxo pipefail
           sudo gem install fastlane -NV
           IPA=$(ls build/*.ipa | head -n1)
-          fastlane deliver \
+          fastlane deliver --verbose \
             --username "$APPLE_ID" \
             --ipa "$IPA" \
             --skip_screenshots true \
             --skip_metadata true \
             --force true
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload debug logs
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: ios-appstore-build
-          path: build/*.ipa
+          name: ios-debug-logs
+          path: |
+            build/**
+            ExportOptions.plist
+            ios/App/App/Info.plist
