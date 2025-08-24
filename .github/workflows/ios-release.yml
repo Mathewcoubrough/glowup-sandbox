@@ -90,7 +90,6 @@ jobs:
           PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
           cp profile.mobileprovision "$PROFILE_PATH"
 
-          # Parse and print profile details
           PROFILE_PLIST="$(security cms -D -i "$PROFILE_PATH")"
           echo "$PROFILE_PLIST" > build/profile.plist
           UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin <<< "$PROFILE_PLIST")
@@ -104,7 +103,6 @@ jobs:
           echo "Profile application-identifier: $APPID"
           echo "Profile TeamIdentifier[0]: $TEAMINPROF"
 
-          # Sanity check: bundle id match
           if [[ -n "${{ secrets.APP_BUNDLE_ID }}" && -n "$APPID" ]]; then
             if [[ "$APPID" != *".${{ secrets.APP_BUNDLE_ID }}" ]]; then
               echo "::error::Provisioning profile app id ($APPID) does not match APP_BUNDLE_ID (${{ secrets.APP_BUNDLE_ID }})"
