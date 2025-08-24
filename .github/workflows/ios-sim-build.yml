@@ -1,0 +1,129 @@
+name: iOS (simulator) build (auto-detect)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Xcode 15.4
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15.4'
+
+      # Ensure minimal app files so the pipeline can't fail on missing inputs
+      - name: Ensure minimal Capacitor app
+        run: |
+          set -e
+          echo "== ensure app ==" | tee -a ci.log
+          test -f package.json || echo '{ "name":"glowup","version":"1.0.0","private":true }' > package.json
+          test -f capacitor.config.json || cat > capacitor.config.json <<'EOF'
+          { "appId": "com.mathe.glowup", "appName": "GlowUp Money", "webDir": "web", "bundledWebRuntime": false }
+          EOF
+          mkdir -p web
+          test -f web/index.html || echo '<!doctype html><title>Hello iOS</title><body style="font-family:system-ui">✅ Hello iOS</body>' > web/index.html
+          ls -la | tee -a ci.log
+          ls -la web | tee -a ci.log
+
+      - name: Install Capacitor toolchain
+        run: |
+          set -xe
+          npm i -D @capacitor/cli @capacitor/core @capacitor/ios 2>&1 | tee -a ci.log
+
+      - name: Prepare iOS platform
+        run: |
+          set -xe
+          npx cap add ios || true 2>&1 | tee -a ci.log
+          npx cap sync ios 2>&1 | tee -a ci.log
+          echo "== ios tree ==" | tee -a ci.log
+          (ls -la ios && ls -la ios/App) 2>&1 | tee -a ci.log || true
+          (find ios -maxdepth 2 -type f | sort | sed -n '1,200p') 2>&1 | tee -a ci.log || true
+
+      # Use CocoaPods CDN (no repo update) to avoid hangs; create Podfile if missing
+      - name: Install CocoaPods and pods (CDN)
+        env:
+          COCOAPODS_DISABLE_STATS: 'true'
+        run: |
+          set -xe
+          if ! command -v pod >/dev/null 2>&1; then sudo gem install cocoapods -NV 2>&1 | tee -a ci.log; fi
+          cd ios/App
+          if [ ! -f Podfile ]; then
+            printf "source 'https://cdn.cocoapods.org/'\nplatform :ios, '13.0'\nuse_frameworks!\n" > Podfile
+            cat >> Podfile <<'PODS'
+            target 'App' do
+              pod 'Capacitor', :path => '../../node_modules/@capacitor/ios'
+              pod 'CapacitorCordova', :path => '../../node_modules/@capacitor/ios'
+            end
+            PODS
+          else
+            grep -q "cdn.cocoapods.org" Podfile || (echo "source 'https://cdn.cocoapods.org/'" | cat - Podfile > Podfile.tmp && mv Podfile.tmp Podfile)
+            grep -q "platform :ios" Podfile || echo "platform :ios, '13.0'" >> Podfile
+          fi
+          echo "== Podfile ==" | tee -a ../../ci.log
+          cat Podfile | tee -a ../../ci.log
+          pod install --no-repo-update --verbose 2>&1 | tee -a ../../ci.log
+          cd ../..
+
+      - name: Detect workspace/project & scheme
+        id: detect
+        run: |
+          set -e
+          W=""
+          if [ -f "ios/App/App.xcworkspace" ]; then W="-workspace ios/App/App.xcworkspace"; PTH="workspace"; else W="-project ios/App/App.xcodeproj"; PTH="project"; fi
+          echo "which=$PTH" >> $GITHUB_OUTPUT
+          echo "path=$W" >> $GITHUB_OUTPUT
+
+          # Pull the first scheme name listed
+          SCHEME=$(xcodebuild -list $W 2>/dev/null | awk 'f{ if(length($0)) {print; exit} } /Schemes:/{f=1}')
+          if [ -z "$SCHEME" ]; then SCHEME="App"; fi
+          echo "scheme=$SCHEME" >> $GITHUB_OUTPUT
+          echo "Detected scheme: $SCHEME" | tee -a ci.log
+
+      - name: Build (Simulator)
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_15.4.app/Contents/Developer
+        run: |
+          set -xe
+          if [ -f "ios/App/App.xcworkspace" ]; then
+            xcodebuild -workspace ios/App/App.xcworkspace \
+              -scheme "${{ steps.detect.outputs.scheme }}" \
+              -configuration Debug -sdk iphonesimulator \
+              -destination 'generic/platform=iOS Simulator' \
+              -derivedDataPath build \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+              clean build 2>&1 | tee -a ci.log
+          else
+            xcodebuild -project ios/App/App.xcodeproj \
+              -scheme "${{ steps.detect.outputs.scheme }}" \
+              -configuration Debug -sdk iphonesimulator \
+              -destination 'generic/platform=iOS Simulator' \
+              -derivedDataPath build \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+              clean build 2>&1 | tee -a ci.log
+          fi
+
+      - name: Upload simulator app (if built)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-build
+          path: build/Build/Products/**/App.app
+          if-no-files-found: ignore
+
+      - name: Upload CI log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: ci.log
