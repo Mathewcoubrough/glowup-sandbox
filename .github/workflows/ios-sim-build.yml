@@ -1,22 +1,31 @@
 name: iOS (simulator) build
+
 on:
-  workflow_dispatch:  # keep only this trigger to avoid branch confusion
+  workflow_dispatch:   # Run button will appear
+
 jobs:
   build-ios-sim:
     runs-on: macos-14
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
 
+      # Pin Xcode to a known-good version on macOS-14
       - name: Setup Xcode 15.4
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: '15.4'
 
-      - name: Ensure minimal Capacitor files exist
+      # Ensure minimum Capacitor files/web exist so the job can't fail on missing inputs
+      - name: Ensure minimal Capacitor app (safe no-op if already present)
         run: |
+          set -euo pipefail
           test -f capacitor.config.json || cat > capacitor.config.json <<'EOF'
           {
             "appId": "com.mathe.glowup",
@@ -39,29 +48,59 @@ jobs:
         run: |
           npx cap add ios || true
           npx cap sync ios
+          echo "== ios/ listing =="
           ls -la ios || true
+          echo "== ios/App listing =="
           ls -la ios/App || true
 
+      # CocoaPods often causes failures; install + update with robust fallbacks
       - name: Install CocoaPods and pods
         run: |
-          sudo gem install cocoapods -NV || true
+          set -euo pipefail
+          if ! command -v pod >/dev/null 2>&1; then
+            echo "Installing CocoaPods via gem…"
+            sudo gem install cocoapods -NV
+          fi
           cd ios/App
           pod repo update || true
           pod install --repo-update
           cd ../..
 
-      - name: Build (Simulator) – iPhone 15 Pro (latest iOS)
-        env:
-          DEVELOPER_DIR: /Applications/Xcode_15.4.app/Contents/Developer
+      # Pick a real, available simulator device ID to avoid destination errors
+      - name: Pick an available Simulator
+        id: picksim
         run: |
           set -euo pipefail
+          xcrun simctl list devices available
+          # Try to find an iPhone 15 Pro; fall back to the first available device
+          DID=$(xcrun simctl list devices available | awk -F'[()]' '/iPhone 15 Pro/ {print $2; exit}')
+          if [ -z "${DID:-}" ]; then
+            DID=$(xcrun simctl list devices available | awk -F'[()]' '/Booted|Shutdown/ {print $2; exit}')
+          fi
+          echo "device_id=$DID" >> $GITHUB_OUTPUT
+
+      - name: Show Xcode setup (debug)
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+          xcodebuild -list -workspace ios/App/App.xcworkspace || true
+          xcodebuild -list -project ios/App/App.xcodeproj || true
+
+      - name: Build (Simulator) – auto device
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_15.4.app/Contents/Developer
+          DEST_ID: ${{ steps.picksim.outputs.device_id }}
+        run: |
+          set -euo pipefail
+          echo "Using Simulator device id: $DEST_ID"
+          DEST="id=${DEST_ID}"
           if [ -f "ios/App/App.xcworkspace" ]; then
             xcodebuild \
               -workspace ios/App/App.xcworkspace \
               -scheme App \
               -configuration Debug \
               -sdk iphonesimulator \
-              -destination 'platform=iOS Simulator,name=iPhone 15 Pro,OS=latest' \
+              -destination "$DEST" \
               -derivedDataPath build \
               CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
               clean build
@@ -71,9 +110,9 @@ jobs:
               -scheme App \
               -configuration Debug \
               -sdk iphonesimulator \
-              -destination 'platform=iOS Simulator,name=iPhone 15 Pro,OS=latest' \
+              -destination "$DEST" \
               -derivedDataPath build \
-              CODE_SIGNING_ALLOWED=NO CODE_SIGN_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
               clean build
           fi
 
